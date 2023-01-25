@@ -1,9 +1,10 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve as resolvePath } from "node:path";
+import path, { dirname, join, resolve as resolvePath } from "node:path";
 import { cwd } from "node:process";
-import { File, FormData } from "undici";
+import { File, FormData, Response } from "undici";
 import { fetchResult } from "../../cfetch";
+import { toMimeType } from "../../create-worker-upload-form";
 import { FatalError } from "../../errors";
 import { logger } from "../../logger";
 import { buildFunctions } from "../../pages/buildFunctions";
@@ -17,6 +18,7 @@ import {
 } from "../../pages/functions/buildWorker";
 import { validateRoutes } from "../../pages/functions/routes-validation";
 import { upload } from "../../pages/upload";
+import type { BundleResult } from "../../bundle";
 import type { Project, Deployment } from "@cloudflare/types";
 
 interface PagesPublishOptions {
@@ -67,6 +69,14 @@ interface PagesPublishOptions {
 	 */
 	bundle?: boolean;
 
+	/**
+	 * Whether to process non-JS module imports or not, such as
+	 * wasm/text/binary, when we run bundling on `functions` or
+	 * `_worker.js`
+	 * Default: false
+	 */
+	experimentalWorkerBundle?: boolean;
+
 	// TODO: Allow passing in the API key and plumb it through
 	// to the API calls so that the publish function does not
 	// rely on the `CLOUDFLARE_API_KEY` environment variable
@@ -88,6 +98,7 @@ export async function publish({
 	commitDirty,
 	functionsDirectory: customFunctionsDirectory,
 	bundle,
+	experimentalWorkerBundle,
 }: PagesPublishOptions) {
 	let _headers: string | undefined,
 		_redirects: string | undefined,
@@ -132,6 +143,8 @@ export async function publish({
 	 * Functions first and exit if it failed
 	 */
 	let builtFunctions: string | undefined = undefined;
+	let workerBundle: BundleResult | undefined = undefined;
+
 	const functionsDirectory =
 		customFunctionsDirectory || join(cwd(), "functions");
 	const routesOutputPath = !existsSync(join(directory, "_routes.json"))
@@ -149,7 +162,7 @@ export async function publish({
 		);
 
 		try {
-			await buildFunctions({
+			workerBundle = await buildFunctions({
 				outfile,
 				outputConfigPath,
 				functionsDirectory,
@@ -161,6 +174,7 @@ export async function publish({
 					project.deployment_configs[isProduction ? "production" : "preview"]
 						.d1_databases ?? {}
 				),
+				experimentalWorkerBundle,
 			});
 
 			builtFunctions = readFileSync(outfile, "utf-8");
@@ -232,9 +246,11 @@ export async function publish({
 	 */
 	if (_workerJS) {
 		let workerFileContents = _workerJS;
-		if (bundle) {
+		const enableBundling = bundle || experimentalWorkerBundle;
+
+		if (enableBundling) {
 			const outfile = join(tmpdir(), `./bundledWorker-${Math.random()}.mjs`);
-			await buildRawWorker({
+			workerBundle = await buildRawWorker({
 				workerScriptPath,
 				outfile,
 				directory: directory ?? ".",
@@ -242,14 +258,50 @@ export async function publish({
 				sourcemap: true,
 				watch: false,
 				onEnd: () => {},
+				experimentalWorkerBundle,
 			});
 			workerFileContents = readFileSync(outfile, "utf8");
 		} else {
 			await checkRawWorker(workerScriptPath, () => {});
 		}
 
-		formData.append("_worker.js", new File([workerFileContents], "_worker.js"));
-		logger.log(`✨ Uploading _worker.js`);
+		if (experimentalWorkerBundle) {
+			const workerBundleFormData = createWorkerBundleFormData(
+				workerBundle as BundleResult
+			);
+			let workerBundleContents = await new Response(
+				workerBundleFormData
+			).text();
+
+			/**
+			 * <hack-alert>
+			 */
+			const undiciGeneratedBoundary = workerBundleContents.split("\r\n")[0];
+			workerBundleContents = workerBundleContents.replaceAll(
+				undiciGeneratedBoundary,
+				"------pages-generated-boundary-00000000"
+			);
+			/**
+			 * </hack-alert>
+			 */
+
+			formData.append(
+				"_worker.bundle",
+				new File([workerBundleContents], "_worker.bundle")
+			);
+			logger.log(`✨ Uploading _worker.bundle`);
+
+			/**
+			 * TODO @Carmen remove when done testing
+			 */
+			// writeFileSync(path.join(directory, "_worker.bundle"), workerBundleContents);
+		} else {
+			formData.append(
+				"_worker.js",
+				new File([workerFileContents], "_worker.js")
+			);
+			logger.log(`✨ Uploading _worker.js`);
+		}
 
 		if (_routesCustom) {
 			// user provided a custom _routes.json file
@@ -276,8 +328,40 @@ export async function publish({
 	 */
 	if (builtFunctions && !_workerJS) {
 		// if Functions were build successfully, proceed to uploading the build file
-		formData.append("_worker.js", new File([builtFunctions], "_worker.js"));
-		logger.log(`✨ Uploading Functions`);
+		if (experimentalWorkerBundle) {
+			const workerBundleFormData = createWorkerBundleFormData(
+				workerBundle as BundleResult
+			);
+			let workerBundleContents = await new Response(
+				workerBundleFormData
+			).text();
+
+			/**
+			 * <hack-alert>
+			 */
+			const undiciGeneratedBoundary = workerBundleContents.split("\r\n")[0];
+			workerBundleContents = workerBundleContents.replaceAll(
+				undiciGeneratedBoundary,
+				"------pages-generated-boundary-00000000"
+			);
+			/**
+			 * </hack-alert>
+			 */
+
+			formData.append(
+				"_worker.bundle",
+				new File([workerBundleContents], "_worker.bundle")
+			);
+			logger.log(`✨ Uploading Functions`);
+
+			/**
+			 * TODO @Carmen remove when done testing
+			 */
+			// writeFileSync(path.join(directory, "_worker.bundle"), workerBundleContents);
+		} else {
+			formData.append("_worker.js", new File([builtFunctions], "_worker.js"));
+			logger.log(`✨ Uploading Functions`);
+		}
 
 		if (_routesCustom) {
 			// user provided a custom _routes.json file
@@ -310,6 +394,13 @@ export async function publish({
 		}
 	}
 
+	/**
+	 * TODO @Carmen remove when done testing
+	 */
+	// const response = new Response(formData)
+	// const blob = await (await response.blob()).text();
+	// writeFileSync(path.join(directory, "_uploadFormData"), blob);
+
 	const deploymentResponse = await fetchResult<Deployment>(
 		`/accounts/${accountId}/pages/projects/${projectName}/deployments`,
 		{
@@ -318,4 +409,52 @@ export async function publish({
 		}
 	);
 	return deploymentResponse;
+}
+
+function createWorkerBundleFormData(workerBundle: BundleResult) {
+	const formData = new FormData();
+
+	/**
+	 * append the main module (_worker.esm)
+	 */
+	const mainModule = {
+		name: path.basename(workerBundle.resolvedEntryPointPath),
+		content: readFileSync(workerBundle.resolvedEntryPointPath, {
+			encoding: "utf-8",
+		}),
+		type: workerBundle.bundleType || "esm",
+	};
+	formData.set(
+		mainModule.name,
+		new File([mainModule.content], mainModule.name, { type: mainModule.type })
+	);
+
+	/**
+	 * append any external modules (binary | wasm | text)
+	 */
+	for (const module of workerBundle.modules) {
+		formData.set(
+			module.name,
+			new File([module.content], module.name, {
+				type: toMimeType(module.type ?? "esm"),
+			})
+		);
+	}
+
+	/**
+	 * append the metadata
+	 */
+	const metadata = {
+		/** The name of the entry point module */
+		main_module: mainModule.name,
+	};
+	formData.set(
+		"metadata",
+		// can we just set to JSON.stringify(metadata) instead?
+		new File([JSON.stringify(metadata)], "metadata", {
+			type: "application/json",
+		})
+	);
+
+	return formData;
 }
