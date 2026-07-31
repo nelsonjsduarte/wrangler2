@@ -1,0 +1,19 @@
+packages/wrangler/src/ai-search/types.ts
+  s_2dabab6169e6c5::t_3d2d4f9e0b2424 58-63,85
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3bd86ffa7b0b69f7ddf30ea53f3f95db1e20284a",
+  "prompts": {},
+  "sessions": {
+    "s_2dabab6169e6c5": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_047f76fcbffe2iHMI7B5Rfal5g",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Nelson Duarte <nelsonjsduarte@gmail.com>"
+    }
+  }
+}
